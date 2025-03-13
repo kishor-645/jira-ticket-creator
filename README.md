@@ -10,6 +10,8 @@ JiraBug is a Flask-based service that bridges Azure Application Insights with Ji
 - Customizable Jira ticket fields
 - Exception trend analysis
 - Real-time exception monitoring
+- Manual trigger support for exception processing
+- Jira connection testing endpoint
 
 ## Configuration
 
@@ -22,6 +24,7 @@ JIRA_TOKEN=your_jira_api_token
 JIRA_EMAIL=your_jira_email
 JIRA_URL=your_jira_instance_url
 JIRA_PROJECT=your_project_key
+AZURE_STORAGE_CONNECTION_STRING=your_azure_storage_connection_string
 ```
 
 ## API Endpoints
@@ -66,6 +69,54 @@ Generates a PowerShell script for querying App Insights:
 
 ```bash
 GET http://your-server:5000/ps
+```
+
+### 4. Test Jira Connection (POST `/bug`)
+
+Tests Jira integration by creating a test ticket:
+
+```bash
+POST http://your-server:5000/bug
+
+Headers:
+Content-Type: application/json
+
+Body:
+{
+    "summary": "Test Bug Ticket",
+    "description": "This is a test bug to verify Jira integration.\n\nEnvironment: Test\nPriority: Medium"
+}
+```
+
+### 5. Manual Exception Processing (POST `/trigger`)
+
+Manually triggers exception processing from App Insights to Jira:
+
+```bash
+POST http://your-server:5000/trigger
+
+Headers:
+Content-Type: application/json
+
+Body:
+{
+    "hours": 24  # Optional: Number of hours to look back (default: 24)
+}
+```
+
+Response format:
+```json
+{
+    "status": "completed",
+    "summary": {
+        "total_exceptions": 10,
+        "tickets_created": 3,
+        "exceptions_skipped": 7,
+        "errors": 0
+    },
+    "error_details": null,
+    "timestamp": "2024-01-20T15:30:00Z"
+}
 ```
 
 ## Postman Collection
@@ -141,7 +192,28 @@ curl -X POST http://your-server:5000/create \
   }'
 ```
 
-### 2. Using the PowerShell script:
+### 2. Testing Jira connection:
+```bash
+curl -X POST http://your-server:5000/bug \
+  -H "Content-Type: application/json" \
+  -d '{
+    "summary": "Test Bug",
+    "description": "Testing Jira integration"
+  }'
+```
+
+### 3. Manually triggering exception processing:
+```bash
+# Process last 24 hours
+curl -X POST http://your-server:5000/trigger
+
+# Process last 48 hours
+curl -X POST http://your-server:5000/trigger \
+  -H "Content-Type: application/json" \
+  -d '{"hours": 48}'
+```
+
+### 4. Using the PowerShell script:
 1. Access `/ps` endpoint
 2. Copy the script content
 3. Run in PowerShell
@@ -203,6 +275,8 @@ curl -X POST http://your-server:5000/create \
 2. Use meaningful titles and descriptions
 3. Add relevant labels for better categorization
 4. Set appropriate priority levels
+5. Test Jira connection using `/bug` endpoint before deployment
+6. Use manual trigger (`/trigger`) for testing and backfilling
 
 ## Contributing
 
@@ -210,6 +284,21 @@ curl -X POST http://your-server:5000/create \
 2. Create a feature branch
 3. Submit a pull request with detailed description
 
-## License
+## Troubleshooting
 
-MIT License
+### Common Issues:
+
+1. Jira Connection Issues:
+   - Verify JIRA_EMAIL and JIRA_TOKEN are correct
+   - Test connection using `/bug` endpoint
+   - Check Jira API permissions
+
+2. App Insights Issues:
+   - Verify APPINSIGHTS_APP_ID and APPINSIGHTS_API_KEY
+   - Test using `/appget` endpoint
+   - Check query timeframe
+
+3. Azure Storage Issues:
+   - Verify AZURE_STORAGE_CONNECTION_STRING
+   - Check table creation permissions
+   - Ensure storage account is accessible

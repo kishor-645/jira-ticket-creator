@@ -5,8 +5,15 @@ import json
 import base64
 from azure.data.tables import TableServiceClient
 from datetime import datetime, timedelta
+from requests.auth import HTTPBasicAuth
 
 app = Flask(__name__)
+
+# Jira configuration
+JIRA_EMAIL = os.getenv('JIRA_EMAIL')
+JIRA_TOKEN = os.getenv('JIRA_TOKEN')
+JIRA_URL = os.getenv('JIRA_URL')
+JIRA_PROJECT = os.getenv('JIRA_PROJECT')
 
 def get_table_client():
     """Get or create Azure Table client for tracking processed exceptions."""
@@ -113,85 +120,125 @@ def query_app_insights():
         traceback.print_exc()
         return []
 
-def create_jira_issue(summary, description, timestamp):
-    """Create a Jira issue (Bug) with the given summary and description."""
-    jira_url = "https://apeirosai.atlassian.net/rest/api/3/issue"
-    jira_email = os.environ['JIRA_EMAIL']
-    jira_api_token = os.environ['JIRA_API_TOKEN']
-    auth = (jira_email, jira_api_token)
+def create_jira_issue(summary, description, issue_type="Bug", timestamp=None):
+    """Helper function to create a Jira ticket
     
-    # Add timestamp to the description
-    full_description = f"Exception Time (UTC): {timestamp}\n\n{description}"
+    Args:
+        summary (str): Issue summary/title
+        description (str): Issue description
+        issue_type (str, optional): Jira issue type. Defaults to "Bug"
+        timestamp (str, optional): Timestamp of the exception. Will be added to description if provided.
+    """
+    url = f"{JIRA_URL}/rest/api/2/issue"
     
+    # Add timestamp to description if provided
+    if timestamp:
+        full_description = f"""Timestamp: {timestamp}
+
+{description}
+
+*This ticket was created by JiraBug automatic exception tracking.*"""
+    else:
+        full_description = description
+    
+    # Basic Jira ticket structure
     payload = {
         "fields": {
-            "project": {"key": "TES"},
-            "summary": f"{summary} - {timestamp}",
+            "project": {
+                "key": JIRA_PROJECT
+            },
+            "summary": summary,
             "description": full_description,
-            "issuetype": {"name": "Bug"}
+            "issuetype": {
+                "name": issue_type
+            }
         }
     }
-    response = requests.post(jira_url, json=payload, auth=auth)
-    try:
-        resp_json = response.json()
-    except Exception:
-        resp_json = {"error": "Could not parse response", "raw": response.text}
     
-    print(f"Jira API response for issue '{summary}': Status Code {response.status_code}, "
-          f"Response: {json.dumps(resp_json, indent=2)}")
-    return response.status_code, resp_json
+    try:
+        response = requests.post(
+            url,
+            json=payload,
+            auth=HTTPBasicAuth(JIRA_EMAIL, JIRA_TOKEN),
+            headers={"Content-Type": "application/json"}
+        )
+        
+        response.raise_for_status()  # Raise exception for non-200 status codes
+        return response.json()
+    except requests.exceptions.RequestException as e:
+        print(f"Error creating Jira ticket: {str(e)}")
+        if hasattr(e.response, 'text'):
+            print(f"Jira API Response: {e.response.text}")
+        raise
 
 @app.route('/events', methods=['POST'])
 def handle_eventgrid():
     """Handle incoming events and create Jira tickets for new exceptions."""
-    events = request.get_json()
-    
-    if isinstance(events, list) and events and events[0].get('eventType') == 'Microsoft.EventGrid.SubscriptionValidationEvent':
-        validation_code = events[0]['data']['validationCode']
-        return jsonify({'validationResponse': validation_code})
-    
-    print("Received payload:", json.dumps(events, indent=2))
-    
-    exceptions = query_app_insights()
-    print(f"Number of exceptions returned: {len(exceptions)}")
-    
-    created = 0
-    skipped = 0
-    errors = []
-    
-    for row in exceptions:
-        if len(row) < 3:  # We need problemId, details, and timestamp
-            print("Skipping row (not enough columns):", row)
-            continue
-
-        problem_id = row[0]
-        details = row[1]
-        timestamp = row[2]
+    try:
+        events = request.get_json()
         
-        # Format timestamp to be valid for Azure Table Storage
-        formatted_timestamp = timestamp.replace(':', '-').replace('.', '-')
+        if isinstance(events, list) and events and events[0].get('eventType') == 'Microsoft.EventGrid.SubscriptionValidationEvent':
+            validation_code = events[0]['data']['validationCode']
+            return jsonify({'validationResponse': validation_code})
         
-        # Skip if this exact exception occurrence was already processed
-        if is_exception_processed(formatted_timestamp):
-            skipped += 1
-            continue
-
-        status, jira_response = create_jira_issue(
-            summary=problem_id,
-            description=details,
-            timestamp=timestamp
-        )
+        print("Received payload:", json.dumps(events, indent=2))
         
-        if status == 201:
-            created += 1
-            mark_exception_processed(formatted_timestamp, problem_id)
-        else:
-            errors.append(jira_response)
+        exceptions = query_app_insights()
+        print(f"Number of exceptions returned: {len(exceptions)}")
+        
+        created = 0
+        skipped = 0
+        errors = []
+        
+        for row in exceptions:
+            if len(row) < 3:  # We need problemId, details, and timestamp
+                print("Skipping row (not enough columns):", row)
+                continue
 
-    return jsonify({
-        "message": f"Processed exceptions. Created {created} Jira bugs, skipped {skipped} already processed exceptions.",
-        "errors": errors
-    })
+            problem_id = row[0]
+            details = row[1]
+            timestamp = row[2]
+            
+            # Format timestamp to be valid for Azure Table Storage
+            formatted_timestamp = timestamp.replace(':', '-').replace('.', '-')
+            
+            # Skip if this exact exception occurrence was already processed
+            if is_exception_processed(formatted_timestamp):
+                skipped += 1
+                continue
+
+            # Create Jira ticket with the timestamp included
+            jira_response = create_jira_issue(
+                summary=f"Exception: {problem_id}",
+                description=details,
+                issue_type="Bug",
+                timestamp=timestamp
+            )
+            
+            if jira_response and 'key' in jira_response:
+                created += 1
+                mark_exception_processed(formatted_timestamp, problem_id)
+            else:
+                errors.append(jira_response)
+
+        return jsonify({
+            "status": "success",
+            "created": created,
+            "skipped": skipped,
+            "errors": errors
+        })
+        
+    except Exception as e:
+        error_msg = str(e)
+        print(f"Error in endpoint: {error_msg}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            "error": error_msg,
+            "count": 0,
+            "exceptions": [],
+            "query_time": datetime.utcnow().isoformat()
+        }), 500
 
 @app.route('/appget', methods=['GET'])
 def get_app_insights_data():
@@ -317,6 +364,151 @@ try {{
     
     # Return the script with proper content type
     return script, 200, {'Content-Type': 'text/plain'}
+
+@app.route('/bug', methods=['POST'])
+def test_jira_connection():
+    """Test endpoint to verify Jira ticket creation"""
+    try:
+        data = request.get_json()
+        
+        if not data:
+            return jsonify({
+                "status": "error",
+                "message": "No JSON data provided"
+            }), 400
+        
+        # Required fields
+        summary = data.get('summary', 'Test Bug Ticket')
+        description = data.get('description', 'This is a test bug ticket')
+        
+        # Create Jira ticket
+        response = create_jira_issue(summary, description)
+        
+        return jsonify({
+            "status": "success",
+            "message": "Jira ticket created successfully",
+            "ticket_key": response.get('key'),
+            "ticket_url": f"{JIRA_URL}/browse/{response.get('key')}",
+            "ticket_details": response
+        })
+        
+    except requests.exceptions.RequestException as e:
+        return jsonify({
+            "status": "error",
+            "message": "Failed to create Jira ticket",
+            "error": str(e),
+            "details": {
+                "jira_url": JIRA_URL,
+                "project": JIRA_PROJECT,
+                "email": JIRA_EMAIL,
+                "token_provided": bool(JIRA_TOKEN)
+            }
+        }), 500
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "message": "Internal server error",
+            "error": str(e)
+        }), 500
+
+@app.route('/trigger', methods=['POST'])
+def manual_trigger():
+    """Manually trigger fetching of App Insights exceptions and create Jira tickets."""
+    try:
+        # Get optional time range from request
+        data = request.get_json() or {}
+        hours = data.get('hours', 24)  # Default to 24 hours if not specified
+        
+        print(f"\n=== Starting manual trigger (last {hours}h) ===")
+        
+        # Fetch exceptions from App Insights
+        exceptions = query_app_insights()
+        print(f"Number of exceptions returned: {len(exceptions)}")
+        
+        created = 0
+        skipped = 0
+        errors = []
+        
+        for row in exceptions:
+            if len(row) < 3:  # We need timestamp, problemId, and details
+                print("Skipping row (not enough columns):", row)
+                continue
+
+            timestamp = row[0]
+            problem_id = row[1]
+            details = row[2]
+            
+            # Format timestamp to be valid for Azure Table Storage
+            formatted_timestamp = timestamp.replace(':', '-').replace('.', '-')
+            
+            # Skip if this exact exception occurrence was already processed
+            if is_exception_processed(formatted_timestamp):
+                print(f"Skipping already processed exception: {problem_id}")
+                skipped += 1
+                continue
+
+            try:
+                # Create Jira ticket
+                jira_response = create_jira_issue(
+                    summary=f"Exception: {problem_id}",
+                    description=f"""
+Exception Details:
+-----------------
+Problem ID: {problem_id}
+Timestamp: {timestamp}
+
+Message:
+{details}
+
+*This ticket was created by JiraBug automatic exception tracking.*
+""",
+                    issue_type="Bug"
+                )
+                
+                # Mark as processed if ticket was created
+                if jira_response and 'key' in jira_response:
+                    created += 1
+                    mark_exception_processed(formatted_timestamp, problem_id)
+                    print(f"Created Jira ticket {jira_response['key']} for {problem_id}")
+                else:
+                    errors.append({
+                        "problem_id": problem_id,
+                        "error": "No ticket key in response",
+                        "response": jira_response
+                    })
+                    
+            except Exception as e:
+                error_detail = str(e)
+                print(f"Error creating ticket for {problem_id}: {error_detail}")
+                errors.append({
+                    "problem_id": problem_id,
+                    "error": error_detail
+                })
+
+        result = {
+            "status": "completed",
+            "summary": {
+                "total_exceptions": len(exceptions),
+                "tickets_created": created,
+                "exceptions_skipped": skipped,
+                "errors": len(errors)
+            },
+            "error_details": errors if errors else None,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        
+        print("\nTrigger Summary:", json.dumps(result, indent=2))
+        return jsonify(result)
+        
+    except Exception as e:
+        error_msg = str(e)
+        print(f"Error in trigger: {error_msg}")
+        traceback.print_exc()
+        return jsonify({
+            "status": "error",
+            "error": error_msg,
+            "timestamp": datetime.utcnow().isoformat()
+        }), 500
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
