@@ -1,3 +1,4 @@
 flask
 requests
 azure-data-tables
+python-dateutil
